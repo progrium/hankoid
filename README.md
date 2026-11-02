@@ -229,7 +229,7 @@ go build -tags dev -o hankoid-dev ./cmd/hankoid
 ./hankoid-dev dev
 ```
 
-`.local/dev` (not committed) starts the compose Postgres and Mailpit, and runs migrations. It then runs a `-tags dev` build of `serve all` on the host, with live reload.
+For local development, run `./dev` from a fresh checkout (needs Go and Docker). It starts the compose Postgres and Mailpit, runs migrations, then runs a `-tags dev` build of `serve all` on the host with live reload. On first run it creates `.local/` (gitignored) with a config (`.local/hanko.yaml`, admins from `ADMINS` or your git email) and an OIDC signing key. Edit the config freely; it's never overwritten.
 
 ## Docker
 
@@ -252,7 +252,7 @@ ADMINS=you@example.com docker compose up --build
   - `COOKIE_SAME_SITE`: session cookie SameSite, default `lax`, which the OIDC provider needs.
   - `OIDC_SIGNING_KEY`: PEM signing key for the OIDC provider, e.g. `OIDC_SIGNING_KEY="$(hankoid oidc genkey)"`. Without it a temporary key is generated at each start.
   - `SMTP_HOST` / `SMTP_PORT`: send email through a real SMTP server instead of Mailpit.
-  - `PLATFORM`: container platform, default `linux/arm64`. Use `linux/amd64` on x86 hosts. `.local/dev` sets it from `uname -m`.
+  - `PLATFORM`: container platform, default `linux/arm64`. Use `linux/amd64` on x86 hosts. `./dev` sets it from `uname -m`.
   - `TRUSTED_PROXIES`: see [Client IP](#client-ip-and-reverse-proxies).
 - Register at http://localhost:8080/signin (the passcode arrives in Mailpit), then open http://localhost:8080/admin/.
 - The compose file is for local use: Mailpit and the defaults aren't production settings. See the [checklist](#security).
