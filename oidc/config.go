@@ -41,6 +41,51 @@ type Config struct {
 	// client IP for rate limiting. Empty means the TCP peer address is used.
 	TrustedProxies []string `yaml:"-"`
 	Clients        []Client `yaml:"clients"`
+	// Resources are protected servers (such as 9P servers) that accept this provider's access
+	// tokens. Device clients get tokens for them.
+	Resources []Resource `yaml:"resources"`
+	// Device configures the device authorization grant (RFC 8628).
+	Device DeviceSettings `yaml:"device"`
+}
+
+// DeviceSettings tune the device authorization grant.
+type DeviceSettings struct {
+	// CodeTTL is how long a device code and user code stay valid (default 10 minutes).
+	CodeTTL time.Duration `yaml:"code_ttl"`
+	// Interval is the minimum polling interval given to clients (default 5 seconds).
+	Interval time.Duration `yaml:"interval"`
+	// GeoHeader names a request header carrying the client's approximate location, such as one a
+	// load balancer adds. It's shown on the /device confirmation page next to the IP address.
+	GeoHeader string `yaml:"geo_header"`
+	// MaxAuthAge is how recent a passkey sign-in must be to approve a device (default 5 minutes).
+	MaxAuthAge time.Duration `yaml:"max_auth_age"`
+}
+
+// Resource is a protected server that accepts access tokens with its audience.
+type Resource struct {
+	ID string `yaml:"id"`
+	// Audience is the aud of tokens for this resource: the URL clients connect to, such as
+	// wss://files.example.com/9p/files.
+	Audience string `yaml:"audience"`
+	// Secret (or SecretHash, bcrypt) authenticates the resource at /oidc/introspect and
+	// /oidc/revocations. Optional for a resource only served by the built-in gateway.
+	Secret     string `yaml:"secret"`
+	SecretHash string `yaml:"secret_hash"`
+}
+
+// Grant types.
+const (
+	GrantAuthorizationCode = "authorization_code"
+	GrantDeviceCode        = "urn:ietf:params:oauth:grant-type:device_code"
+	GrantRefreshToken      = "refresh_token"
+)
+
+// grantAlias accepts "device_code" as shorthand for the device grant's URN in config.
+func grantAlias(g string) string {
+	if g == "device_code" {
+		return GrantDeviceCode
+	}
+	return g
 }
 
 // Client is a registered relying party.
@@ -56,7 +101,29 @@ type Client struct {
 	// Access decides who may sign in. Required; use {any_user: true} to allow every Hanko user.
 	Access     *frontend.AccessRule `yaml:"access"`
 	RolesClaim bool                 `yaml:"roles_claim"`
+	// TokenEndpointAuthMethod is client_secret_basic/client_secret_post (the default: either is
+	// accepted) or "none" for a public client, which only the device grant may use.
+	TokenEndpointAuthMethod string `yaml:"token_endpoint_auth_method"`
+	// GrantTypes the client may use: authorization_code (the default) and/or device_code.
+	// Device clients also get refresh tokens when they ask for offline_access.
+	GrantTypes []string `yaml:"grant_types"`
+	// Resources are the IDs of oidc.resources this client may get access tokens for.
+	Resources []string `yaml:"resources"`
+	// RefreshTokenIdleTTL is how long an unused refresh token stays valid (default 30 days).
+	// Each refresh starts it again.
+	RefreshTokenIdleTTL time.Duration `yaml:"refresh_token_idle_ttl"`
+	// RefreshTokenMaxTTL, if set, is a device's absolute lifetime from its approval.
+	RefreshTokenMaxTTL time.Duration `yaml:"refresh_token_max_ttl"`
 }
+
+// Public reports whether the client has no secret (token_endpoint_auth_method: none).
+func (c *Client) Public() bool { return c.TokenEndpointAuthMethod == "none" }
+
+// AllowsGrant reports whether the client may use grant type g.
+func (c *Client) AllowsGrant(g string) bool { return slices.Contains(c.GrantTypes, grantAlias(g)) }
+
+// IsDevice reports whether the client uses the device grant.
+func (c *Client) IsDevice() bool { return c.AllowsGrant(GrantDeviceCode) }
 
 // DisplayName is the client's name for the sign-in page.
 func (c *Client) DisplayName() string {
@@ -74,6 +141,36 @@ func (c *Client) Allows(s *frontend.Session) bool {
 // AllowsScope reports whether the client may request scope.
 func (c *Client) AllowsScope(scope string) bool {
 	return slices.Contains(c.Scopes, scope)
+}
+
+// Resource returns the resource with the given ID, or nil.
+func (c *Config) Resource(id string) *Resource {
+	for i := range c.Resources {
+		if c.Resources[i].ID == id {
+			return &c.Resources[i]
+		}
+	}
+	return nil
+}
+
+// ResourceByAudience returns the resource with the given audience, or nil.
+func (c *Config) ResourceByAudience(aud string) *Resource {
+	for i := range c.Resources {
+		if c.Resources[i].Audience == aud {
+			return &c.Resources[i]
+		}
+	}
+	return nil
+}
+
+// DeviceEnabled reports whether any client uses the device grant.
+func (c *Config) DeviceEnabled() bool {
+	for i := range c.Clients {
+		if c.Clients[i].IsDevice() {
+			return true
+		}
+	}
+	return false
 }
 
 // Enabled reports whether the provider should be served.
@@ -165,14 +262,46 @@ func LoadConfig(raw []byte, publicURL, baseDir string) (*Config, error) {
 			}
 			cl.Access.Users = frontend.SplitList(v)
 		}
+		if len(cl.GrantTypes) == 0 {
+			cl.GrantTypes = []string{GrantAuthorizationCode}
+		}
+		for j, g := range cl.GrantTypes {
+			cl.GrantTypes[j] = grantAlias(g)
+		}
 		if len(cl.Scopes) == 0 {
 			cl.Scopes = []string{"openid", "email", "profile"}
+			if cl.IsDevice() {
+				cl.Scopes = append(cl.Scopes, "offline_access")
+			}
+		}
+		if cl.IsDevice() && cl.RefreshTokenIdleTTL == 0 {
+			cl.RefreshTokenIdleTTL = 30 * 24 * time.Hour
 		}
 		if cl.RolesClaim && !cl.AllowsScope("roles") {
 			cl.Scopes = append(cl.Scopes, "roles")
 		}
 	}
+	for i := range c.Resources {
+		r := &c.Resources[i]
+		if v := os.Getenv(ResourceEnvPrefix(r.ID) + "SECRET"); v != "" {
+			r.Secret = v
+		}
+	}
+	if c.Device.CodeTTL == 0 {
+		c.Device.CodeTTL = 10 * time.Minute
+	}
+	if c.Device.Interval == 0 {
+		c.Device.Interval = 5 * time.Second
+	}
+	if c.Device.MaxAuthAge == 0 {
+		c.Device.MaxAuthAge = 5 * time.Minute
+	}
 	return c, c.Validate()
+}
+
+// ResourceEnvPrefix is the environment variable prefix for a resource, e.g. OIDC_RESOURCES_FILES_.
+func ResourceEnvPrefix(id string) string {
+	return "OIDC_RESOURCES_" + envName.ReplaceAllString(strings.ToUpper(id), "_") + "_"
 }
 
 // Validate checks the provider configuration.
@@ -214,11 +343,42 @@ func (c *Config) Validate() error {
 		}
 		seen[cl.ID] = true
 		where = fmt.Sprintf("oidc client %q", cl.ID)
-		if cl.Secret == "" && cl.SecretHash == "" {
-			errs = append(errs, fmt.Errorf("%s: secret or secret_hash is required (or set %sSECRET)", where, ClientEnvPrefix(cl.ID)))
+		for _, g := range cl.GrantTypes {
+			if g != GrantAuthorizationCode && g != GrantDeviceCode {
+				errs = append(errs, fmt.Errorf("%s: unsupported grant type %q (authorization_code or device_code)", where, g))
+			}
 		}
-		if len(cl.RedirectURIs) == 0 {
+		switch cl.TokenEndpointAuthMethod {
+		case "", "client_secret_basic", "client_secret_post":
+			if cl.Secret == "" && cl.SecretHash == "" {
+				errs = append(errs, fmt.Errorf("%s: secret or secret_hash is required (or set %sSECRET)", where, ClientEnvPrefix(cl.ID)))
+			}
+		case "none":
+			if cl.AllowsGrant(GrantAuthorizationCode) || !cl.IsDevice() {
+				errs = append(errs, fmt.Errorf("%s: token_endpoint_auth_method none is only allowed with grant_types [device_code]", where))
+			}
+			if cl.Secret != "" || cl.SecretHash != "" {
+				errs = append(errs, fmt.Errorf("%s: a public client (token_endpoint_auth_method none) must not have a secret", where))
+			}
+		default:
+			errs = append(errs, fmt.Errorf("%s: token_endpoint_auth_method must be client_secret_basic, client_secret_post or none", where))
+		}
+		if cl.AllowsGrant(GrantAuthorizationCode) && len(cl.RedirectURIs) == 0 {
 			errs = append(errs, fmt.Errorf("%s: at least one redirect_uri is required", where))
+		}
+		if cl.IsDevice() && c.Store != StorePostgres {
+			errs = append(errs, fmt.Errorf("%s: the device grant needs oidc.store: postgres, so pending logins and refresh tokens survive restarts", where))
+		}
+		if cl.AllowsScope("offline_access") && !cl.IsDevice() {
+			errs = append(errs, fmt.Errorf("%s: offline_access (refresh tokens) is only for device clients", where))
+		}
+		if cl.RefreshTokenIdleTTL < 0 || cl.RefreshTokenMaxTTL < 0 {
+			errs = append(errs, fmt.Errorf("%s: refresh token TTLs must not be negative", where))
+		}
+		for _, id := range cl.Resources {
+			if c.Resource(id) == nil {
+				errs = append(errs, fmt.Errorf("%s: unknown resource %q", where, id))
+			}
 		}
 		for _, u := range append(append([]string{}, cl.RedirectURIs...), cl.PostLogoutRedirectURIs...) {
 			if err := validateRedirect(u); err != nil {
@@ -239,6 +399,31 @@ func (c *Config) Validate() error {
 		if cl.RolesClaim && (cl.Access == nil || strings.TrimSpace(cl.Access.Organization) == "") {
 			errs = append(errs, fmt.Errorf("%s: roles_claim requires access.organization", where))
 		}
+	}
+	seenRes := map[string]bool{}
+	for i, r := range c.Resources {
+		where := fmt.Sprintf("oidc.resources[%d]", i)
+		if r.ID == "" {
+			errs = append(errs, fmt.Errorf("%s: id is required", where))
+		} else if seenRes[r.ID] {
+			errs = append(errs, fmt.Errorf("%s: duplicate id %q", where, r.ID))
+		}
+		seenRes[r.ID] = true
+		where = fmt.Sprintf("oidc resource %q", r.ID)
+		u, err := url.Parse(r.Audience)
+		if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+			(u.Scheme != "https" && u.Scheme != "wss" && !((u.Scheme == "http" || u.Scheme == "ws") && isLoopbackHost(u.Hostname()))) {
+			errs = append(errs, fmt.Errorf("%s: audience must be an https:// or wss:// URL without query (http/ws only for localhost)", where))
+		}
+		if c.ResourceByAudience(r.Audience) != &c.Resources[i] {
+			errs = append(errs, fmt.Errorf("%s: duplicate audience %q", where, r.Audience))
+		}
+		if r.Secret != "" && len(r.Secret) < 16 && !isLoopbackURL(c.Issuer) {
+			errs = append(errs, fmt.Errorf("%s: secret must be at least 16 characters", where))
+		}
+	}
+	if c.Device.CodeTTL < time.Minute || c.Device.Interval < time.Second || c.Device.MaxAuthAge <= 0 {
+		errs = append(errs, errors.New("oidc.device: code_ttl must be at least 1m, interval at least 1s, max_auth_age positive"))
 	}
 	return errors.Join(errs...)
 }

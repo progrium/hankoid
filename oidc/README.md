@@ -46,11 +46,11 @@ With `roles_claim: true` (which requires `access.organization`), ID tokens and u
 
 **Discovery** (`{issuer}/.well-known/openid-configuration`) advertises:
 
-- `response_types_supported: [code]`, `grant_types_supported: [authorization_code]`
+- `response_types_supported: [code]`, `grant_types_supported: [authorization_code]`, plus the device code and `refresh_token` grants and `device_authorization_endpoint`, `introspection_endpoint` and `revocation_endpoint` when the Postgres store is on
 - `id_token_signing_alg_values_supported: [RS256]`, `subject_types_supported: [public]`
 - `code_challenge_methods_supported: [S256]`
-- `token_endpoint_auth_methods_supported: [client_secret_basic, client_secret_post]`
-- `scopes_supported: [openid, email, profile]`, plus `roles` when a client enables it
+- `token_endpoint_auth_methods_supported: [client_secret_basic, client_secret_post]`, plus `none` with the Postgres store (public device clients)
+- `scopes_supported: [openid, email, profile]`, plus `roles` when a client enables it, and `offline_access` with the Postgres store
 
 Discovery, JWKS and userinfo allow any origin (CORS, no credentials). Authorize, token and logout don't.
 
@@ -63,7 +63,7 @@ Discovery, JWKS and userinfo allow any origin (CORS, no credentials). Authorize,
 
 **Token endpoint:**
 
-- `grant_type=authorization_code` only; no refresh tokens. Clients sign in again when their own session ends.
+- `grant_type=authorization_code` for web clients, which get no refresh tokens and sign in again when their own session ends. Device clients use the device code and refresh token grants (below).
 - Errors are RFC 6749 JSON (`invalid_client` with 401 and `WWW-Authenticate`, `invalid_grant`, `invalid_request`, `unsupported_grant_type`). Responses are `Cache-Control: no-store`.
 - A verifier sent for a code issued without a challenge is refused as a PKCE downgrade.
 - Rate limit: a burst of 10 refilling at 1 per second, per client IP and per client, in memory. Up to 10,000 buckets; idle ones (10 minutes) are evicted, and beyond that new keys share one bucket.
@@ -82,6 +82,31 @@ Discovery, JWKS and userinfo allow any origin (CORS, no credentials). Authorize,
 3. The user is redirected (303) to `post_logout_redirect_uri` with `state` if it exactly matches the client's list; otherwise a "Signed out" page is shown.
 4. Without a hint, a confirmation page is shown; only its same-origin POST signs out.
 
+## Device sign-in
+
+**Device authorization** (`POST /oidc/device_authorization`, RFC 8628 §3.1) takes `client_id`, `scope`, an optional `resource` (RFC 8707; default the client's only resource) and an optional `device_name` (shown on the confirm page, 64 characters at most). It answers `device_code`, `user_code`, `verification_uri` (`{public_url}/device`), `verification_uri_complete`, `expires_in` and `interval`. It's limited per IP.
+
+**Polling** (`grant_type=urn:ietf:params:oauth:grant-type:device_code`, or `device_code` as a shorthand in config) answers `authorization_pending`, `slow_down` (and the interval grows by 5 seconds), `access_denied` or `expired_token`, and once approved the tokens, once. The client's `access` rule is checked again at that point.
+
+**Refresh** (`grant_type=refresh_token`, with an optional `resource` from the client's list) rotates the refresh token every time. The old one keeps working for 30 seconds, so parallel reconnects don't sign each other out. After that, presenting it is treated as theft (RFC 9700 §4.14.2) and revokes the device. Refresh also checks the user still exists and still passes the client's `access` rule. A refresh token expires after `refresh_token_idle_ttl` without use (30 days by default) and, with `refresh_token_max_ttl`, that long after approval.
+
+**Device access tokens** carry `aud` (the resource's audience, or `{issuer}/userinfo` without one), `client_id`, `scope`, `did` (the device ID), `preferred_username` and `auth_time`.
+
+**Clients** for devices are usually public (`token_endpoint_auth_method: none`, no secret, `grant_types: [device_code]`). `offline_access` is only granted to device clients.
+
+## Protected resources
+
+A resource is anything that accepts these access tokens, such as a 9P server. It's registered under `oidc.resources` with an `audience` (an `https` or `wss` URL; `http` and `ws` only for loopback) and a secret, and it can:
+
+- **Verify tokens itself:** check the signature against `{issuer}/jwks.json`, `iss`, `typ: at+jwt`, `exp`, and that its audience is in `aud`. This doesn't notice a removed device until the token expires (5 minutes by default), so pair it with the revocations feed.
+- **Introspect** (`POST /oidc/introspect`, RFC 7662, with its ID and secret as HTTP Basic or `client_id`/`client_secret`): `active` is true only for tokens issued for this resource's audience whose device is still active. The answer includes `sub`, `username`, `did`, `client_id`, `scope` and `exp`.
+- **Poll revocations** (`GET /oidc/revocations?since=RFC3339`, same credentials): devices revoked since then, with a `cursor` for the next call. Entries overlap a little between calls, so treat them as idempotent. A resource with long-lived connections should poll every few seconds and close any connection for a listed `device_id`.
+- **Advertise its issuer** with RFC 9728 metadata. For a resource on the frontend's own host, hankoid serves it at `/.well-known/oauth-protected-resource{path}`, with `hankoid_device_client_id` naming the public device client that lists the resource, so `hankoid login URL` needs nothing else. A resource elsewhere can serve the same document, or users pass `--issuer` and `--client`.
+
+Device clients can sign a device out themselves with `POST /oidc/revoke` (RFC 7009) and their refresh token; the answer is 200 whether or not the token was known.
+
+**In process**, `Provider.Authenticate`, `IssueTicket`/`RedeemTicket` (single-use, 30-second tickets for browsers that can't send headers with a WebSocket handshake) and `OnRevoke` give the same checks without HTTP; the built-in gateway uses them.
+
 ## State and restarts
 
 `oidc.store` (or `OIDC_STORE`) decides where authorization codes live.
@@ -98,7 +123,8 @@ Discovery, JWKS and userinfo allow any origin (CORS, no credentials). Authorize,
 
 - The frontend reads Hanko's `database` section (and `DATABASE_*` variables) and connects with a pool of up to 4 connections. A non-Postgres dialect is a startup error.
 - At startup it creates the `hankoid` schema and applies any pending migrations under an advisory lock, so replicas can start together. `hankoid oidc migrate --config …` does the same as a separate step. `hankoid migrate up` only migrates Hanko's own tables and never touches `hankoid`.
-- Rows are deleted an hour after their code expires, by every instance, every 10 minutes.
+- Rows are deleted an hour after their code expires, by every instance, every 10 minutes. The same sweep removes expired device grants, tickets, and refresh tokens and devices past their expiry.
+- Device sign-in keeps its state in `hankoid.oidc_device_grants`, `oidc_devices`, `oidc_refresh_tokens` and `gateway_tickets`. Device codes, refresh tokens and tickets are stored only as SHA-256 hashes, and user codes as an HMAC keyed from `secrets.keys`.
 - If the database is down, authorize redirects with `error=temporarily_unavailable` and the token endpoint answers 500 `server_error`.
 - Switching stores invalidates only the codes issued in the last 60 seconds. `DROP SCHEMA hankoid CASCADE` removes everything the provider stored without affecting Hanko.
 
@@ -132,4 +158,8 @@ Discovery, JWKS and userinfo allow any origin (CORS, no credentials). Authorize,
 | Tokens stop verifying after a restart | no persistent signing key configured |
 | Passkeys fail on `/signin` | `public_url`'s origin isn't in `webauthn.relying_party.origins` (startup warns) |
 | `429 slow_down` from the token endpoint | rate limit; behind a proxy, set `server.frontend.trusted_proxies` so clients aren't all seen as the proxy's IP |
+| `/device` keeps asking to sign in again | approving needs a sign-in from the last `oidc.device.max_auth_age` (5 minutes); passkey sign-in takes a second |
+| The confirm page shows the proxy's IP | `server.frontend.trusted_proxies` isn't set to the actual proxy chain |
+| `hankoid cred get` says "run hankoid login" | the device was removed, its refresh token was replayed after rotation, or it went unused for `refresh_token_idle_ttl` |
+| `invalid_target` from device authorization or refresh | the `resource` isn't in the client's `resources` |
 | Startup refuses the config | secrets too short, a `change-me` placeholder key, or non-https redirect URIs on a non-localhost `public_url` |

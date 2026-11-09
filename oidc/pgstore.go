@@ -47,63 +47,64 @@ func OpenPostgres(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 }
 
 // Migrate creates the hankoid schema and applies any embedded migrations not yet recorded in
-// hankoid.schema_migrations, each in its own transaction. It's safe to run concurrently and
-// repeatedly. Hanko's own migrations ("hankoid migrate up") never touch this schema.
+// hankoid.schema_migrations. Everything runs in one transaction under a transaction-scoped
+// advisory lock, so it's safe to run concurrently and repeatedly, and it works through a
+// transaction-mode connection pooler (PgBouncer and most managed Postgres offerings), where a
+// session-level lock could be taken and released on different server connections. A failing
+// migration rolls back all of them. Hanko's own migrations ("hankoid migrate up") never touch
+// this schema.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) (applied []int, err error) {
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", int64(migrationLock)); err != nil {
-		return nil, fmt.Errorf("migration lock: %w", err)
-	}
-	defer func() {
-		_, _ = conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", int64(migrationLock))
-	}()
-	if _, err := conn.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS hankoid;
-CREATE TABLE IF NOT EXISTS hankoid.schema_migrations (
-  version    integer PRIMARY KEY,
-  applied_at timestamptz NOT NULL DEFAULT now()
-)`); err != nil {
-		return nil, fmt.Errorf("create hankoid schema: %w", err)
-	}
-	done := map[int]bool{}
-	rows, err := conn.Query(ctx, "SELECT version FROM hankoid.schema_migrations")
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		done[v] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
 	migs, err := migrations()
 	if err != nil {
 		return nil, err
 	}
-	for _, m := range migs {
-		if done[m.version] {
-			continue
+	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		applied = nil
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", int64(migrationLock)); err != nil {
+			return fmt.Errorf("migration lock: %w", err)
 		}
-		err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, m.sql); err != nil {
+		if _, err := tx.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS hankoid"); err != nil {
+			return fmt.Errorf("create hankoid schema: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS hankoid.schema_migrations (
+  version    integer PRIMARY KEY,
+  applied_at timestamptz NOT NULL DEFAULT now()
+)`); err != nil {
+			return fmt.Errorf("create hankoid schema: %w", err)
+		}
+		done := map[int]bool{}
+		rows, err := tx.Query(ctx, "SELECT version FROM hankoid.schema_migrations")
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var v int
+			if err := rows.Scan(&v); err != nil {
+				rows.Close()
 				return err
 			}
-			_, err := tx.Exec(ctx, "INSERT INTO hankoid.schema_migrations (version) VALUES ($1)", m.version)
-			return err
-		})
-		if err != nil {
-			return applied, fmt.Errorf("migration %s: %w", m.name, err)
+			done[v] = true
 		}
-		applied = append(applied, m.version)
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, m := range migs {
+			if done[m.version] {
+				continue
+			}
+			if _, err := tx.Exec(ctx, m.sql); err != nil {
+				return fmt.Errorf("migration %s: %w", m.name, err)
+			}
+			if _, err := tx.Exec(ctx, "INSERT INTO hankoid.schema_migrations (version) VALUES ($1)", m.version); err != nil {
+				return fmt.Errorf("migration %s: %w", m.name, err)
+			}
+			applied = append(applied, m.version)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return applied, nil
 }

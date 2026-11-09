@@ -35,6 +35,10 @@ type Provider struct {
 	limitMu  sync.Mutex
 	limiters map[string]*limiterEntry
 	proxies  frontend.Proxies
+
+	devices     *DeviceStore // nil unless oidc.store is postgres
+	hookMu      sync.Mutex
+	revokeHooks []func([]string)
 }
 
 // New builds a provider. cfg must already be validated. A nil store keeps codes in memory
@@ -75,6 +79,10 @@ func (p *Provider) Handler() http.Handler {
 	mux.HandleFunc("GET /oidc/jwks.json", cors(p.jwks))
 	mux.HandleFunc("GET /oidc/authorize", p.authorize)
 	mux.HandleFunc("POST /oidc/token", p.token)
+	mux.HandleFunc("POST /oidc/device_authorization", p.deviceAuthorization)
+	mux.HandleFunc("POST /oidc/introspect", p.introspect)
+	mux.HandleFunc("GET /oidc/revocations", p.revocations)
+	mux.HandleFunc("POST /oidc/revoke", p.revoke)
 	mux.HandleFunc("GET /oidc/userinfo", cors(p.userinfo))
 	mux.HandleFunc("POST /oidc/userinfo", cors(p.userinfo))
 	mux.HandleFunc("OPTIONS /oidc/userinfo", cors(func(w http.ResponseWriter, r *http.Request) {}))
@@ -103,8 +111,9 @@ func (p *Provider) discovery(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	w.Header().Set("Cache-Control", "public, max-age=300")
-	writeJSON(w, http.StatusOK, map[string]any{
+	grants := []string{GrantAuthorizationCode}
+	auth := []string{"client_secret_basic", "client_secret_post"}
+	doc := map[string]any{
 		"issuer":                                p.cfg.Issuer,
 		"authorization_endpoint":                p.endpoint("authorize"),
 		"token_endpoint":                        p.endpoint("token"),
@@ -113,15 +122,25 @@ func (p *Provider) discovery(w http.ResponseWriter, r *http.Request) {
 		"jwks_uri":                              p.endpoint("jwks.json"),
 		"response_types_supported":              []string{"code"},
 		"response_modes_supported":              []string{"query"},
-		"grant_types_supported":                 []string{"authorization_code"},
+		"grant_types_supported":                 &grants,
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"code_challenge_methods_supported":      []string{"S256"},
-		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
-		"scopes_supported":                      scopes,
+		"token_endpoint_auth_methods_supported": &auth,
+		"scopes_supported":                      &scopes,
 		"claims_supported":                      claims,
 		"prompt_values_supported":               []string{"none", "login"},
-	})
+	}
+	if p.cfg.DeviceEnabled() && p.devices != nil {
+		doc["device_authorization_endpoint"] = p.endpoint("device_authorization")
+		doc["revocation_endpoint"] = p.endpoint("revoke")
+		doc["introspection_endpoint"] = p.endpoint("introspect")
+		grants = append(grants, GrantDeviceCode, GrantRefreshToken)
+		auth = append(auth, "none")
+		scopes = append(scopes, "offline_access")
+	}
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	writeJSON(w, http.StatusOK, doc)
 }
 
 func (p *Provider) jwks(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +157,7 @@ func (p *Provider) authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	redirectURI := q.Get("redirect_uri")
-	if !slices.Contains(client.RedirectURIs, redirectURI) {
+	if !client.AllowsGrant(GrantAuthorizationCode) || !slices.Contains(client.RedirectURIs, redirectURI) {
 		errorPage(w, http.StatusBadRequest, "Invalid redirect", "The application sent an unregistered redirect address.")
 		return
 	}
@@ -270,6 +289,12 @@ type limiterEntry struct {
 // limiter returns the token bucket for key. Entries idle for over 10 minutes are evicted when the
 // table grows, so a flood of new keys can't reset everyone's buckets.
 func (p *Provider) limiter(key string) *rate.Limiter {
+	return p.limiterN(key, time.Second, 10)
+}
+
+// limiterN is limiter with a bucket that refills one token per every, holding burst. Keys must
+// not be shared between different rates.
+func (p *Provider) limiterN(key string, every time.Duration, burst int) *rate.Limiter {
 	p.limitMu.Lock()
 	defer p.limitMu.Unlock()
 	now := p.now()
@@ -291,7 +316,7 @@ func (p *Provider) limiter(key string) *rate.Limiter {
 			}
 		}
 	}
-	e := &limiterEntry{l: rate.NewLimiter(rate.Every(time.Second), 10), seen: now}
+	e := &limiterEntry{l: rate.NewLimiter(rate.Every(every), burst), seen: now}
 	p.limiters[key] = e
 	return e.l
 }
@@ -308,6 +333,13 @@ func (p *Provider) authenticateClient(r *http.Request) *Client {
 		id, secret = r.PostForm.Get("client_id"), r.PostForm.Get("client_secret")
 	}
 	client := p.cfg.Client(id)
+	if client != nil && client.Public() {
+		// A public client is identified by client_id alone, and must not present a secret.
+		if secret != "" {
+			return nil
+		}
+		return client
+	}
 	if client == nil || secret == "" {
 		return nil
 	}
@@ -323,7 +355,8 @@ func (p *Provider) authenticateClient(r *http.Request) *Client {
 	return client
 }
 
-// token implements the token endpoint for the authorization_code grant (OIDC Core §3.1.3).
+// token implements the token endpoint: the authorization_code grant (OIDC Core §3.1.3), and for
+// device clients the device_code (RFC 8628) and refresh_token grants.
 func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	if err := r.ParseForm(); err != nil {
@@ -340,15 +373,31 @@ func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 		tokenError(w, http.StatusUnauthorized, "invalid_client", "client authentication failed")
 		return
 	}
-	if !p.limiter("client:" + client.ID).Allow() {
+	// Public clients share one client_id across every device, so a per-client bucket would let
+	// anyone stall everyone's logins. Device polling is paced per grant instead.
+	if !client.Public() && !p.limiter("client:"+client.ID).Allow() {
 		w.Header().Set("Retry-After", "1")
 		tokenError(w, http.StatusTooManyRequests, "slow_down", "too many requests")
 		return
 	}
-	if gt := r.PostForm.Get("grant_type"); gt != "authorization_code" {
-		tokenError(w, http.StatusBadRequest, "unsupported_grant_type", "only authorization_code is supported")
-		return
+	switch gt := grantAlias(r.PostForm.Get("grant_type")); {
+	case gt == GrantAuthorizationCode && client.AllowsGrant(gt):
+		p.authorizationCodeGrant(w, r, client)
+	case (gt == GrantDeviceCode || gt == GrantRefreshToken) && p.devices != nil && client.IsDevice():
+		if gt == GrantDeviceCode {
+			p.deviceCodeGrant(w, r, client)
+		} else {
+			p.refreshTokenGrant(w, r, client)
+		}
+	case gt == GrantAuthorizationCode || (p.devices != nil && (gt == GrantDeviceCode || gt == GrantRefreshToken)):
+		tokenError(w, http.StatusBadRequest, "unauthorized_client", "this client may not use "+gt)
+	default:
+		tokenError(w, http.StatusBadRequest, "unsupported_grant_type", "unsupported grant_type")
 	}
+}
+
+// authorizationCodeGrant redeems an authorization code (OIDC Core §3.1.3).
+func (p *Provider) authorizationCodeGrant(w http.ResponseWriter, r *http.Request, client *Client) {
 	d, err := p.codes.Redeem(r.Context(), r.PostForm.Get("code"))
 	if err != nil && !errors.Is(err, errBadCode) {
 		log.Printf("oidc: redeem code: %v", err)
@@ -388,7 +437,7 @@ func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	claims, err := p.userClaims(r, d.UserID, d.Scope, client)
+	u, err := p.lookupUser(r, d.UserID, d.Scope, client)
 	if errors.Is(err, errAccessRevoked) {
 		tokenError(w, http.StatusBadRequest, "invalid_grant", "access to this client was revoked")
 		return
@@ -398,57 +447,8 @@ func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 		tokenError(w, http.StatusBadRequest, "invalid_grant", "user unavailable")
 		return
 	}
-	now := p.now()
-	idt := jwt.New()
-	set := func(t jwt.Token, k string, v any) { _ = t.Set(k, v) }
-	set(idt, jwt.IssuerKey, p.cfg.Issuer)
-	set(idt, jwt.SubjectKey, d.UserID)
-	set(idt, jwt.AudienceKey, []string{client.ID})
-	set(idt, jwt.IssuedAtKey, now)
-	set(idt, jwt.ExpirationKey, now.Add(p.cfg.IDTokenTTL))
-	set(idt, "auth_time", d.AuthTime.Unix())
-	set(idt, "azp", client.ID)
-	if d.Nonce != "" {
-		set(idt, "nonce", d.Nonce)
-	}
-	if d.SessionID != "" {
-		set(idt, "sid", d.SessionID)
-	}
-	for k, v := range claims {
-		set(idt, k, v)
-	}
-	idToken, err := p.sign(idt)
-	if err != nil {
-		log.Printf("oidc: sign id token: %v", err)
-		tokenError(w, http.StatusInternalServerError, "server_error", "")
-		return
-	}
-	at := jwt.New()
-	set(at, jwt.IssuerKey, p.cfg.Issuer)
-	set(at, jwt.SubjectKey, d.UserID)
-	set(at, jwt.AudienceKey, []string{p.endpoint("userinfo")})
-	set(at, jwt.IssuedAtKey, now)
-	set(at, jwt.ExpirationKey, now.Add(p.cfg.AccessTokenTTL))
-	set(at, jwt.JwtIDKey, randomID())
-	set(at, "client_id", client.ID)
-	set(at, "scope", d.Scope)
-	if d.SessionID != "" {
-		set(at, "sid", d.SessionID)
-	}
-	accessToken, err := p.signTyp(at, "at+jwt")
-	if err != nil {
-		log.Printf("oidc: sign access token: %v", err)
-		tokenError(w, http.StatusInternalServerError, "server_error", "")
-		return
-	}
-	noStore(w)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token": accessToken,
-		"token_type":   "Bearer",
-		"expires_in":   int(p.cfg.AccessTokenTTL.Seconds()),
-		"id_token":     idToken,
-		"scope":        d.Scope,
-	})
+	p.writeTokens(w, tokenGrant{client: client, userID: d.UserID, sessionID: d.SessionID, nonce: d.Nonce,
+		scope: d.Scope, authTime: d.AuthTime, user: u})
 }
 
 // validVerifier checks RFC 7636 §4.1: 43-128 characters of [A-Za-z0-9-._~].
@@ -486,12 +486,25 @@ func tokenTyp(raw string) string {
 	return msg.Signatures()[0].ProtectedHeaders().Type()
 }
 
-var errAccessRevoked = errors.New("access revoked")
+var (
+	errAccessRevoked = errors.New("access revoked")
+	errUserGone      = errors.New("user no longer exists")
+)
 
-// userClaims builds the email/profile/roles claims for a user, limited by scope, using the admin
-// API's user record. It re-checks the client's access rule so a revoked membership takes effect.
-func (p *Provider) userClaims(r *http.Request, userID, scope string, client *Client) (map[string]any, error) {
+// userInfo is a user's claims for a client, and their username and session-like identity.
+type userInfo struct {
+	claims   map[string]any
+	username string
+	session  *frontend.Session
+}
+
+// lookupUser loads a user through the admin API, re-checks the client's access rule (so a revoked
+// membership takes effect), and builds their claims for scope. A deleted user is errUserGone.
+func (p *Provider) lookupUser(r *http.Request, userID, scope string, client *Client) (*userInfo, error) {
 	u, err := p.hanko.User(r.Context(), userID)
+	if errors.Is(err, frontend.ErrNotFound) {
+		return nil, errUserGone
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +540,16 @@ func (p *Provider) userClaims(r *http.Request, userID, scope string, client *Cli
 		}
 		claims["roles"] = roles
 	}
-	return claims, nil
+	return &userInfo{claims: claims, username: username, session: who}, nil
+}
+
+// userClaims is lookupUser's claims.
+func (p *Provider) userClaims(r *http.Request, userID, scope string, client *Client) (map[string]any, error) {
+	u, err := p.lookupUser(r, userID, scope, client)
+	if err != nil {
+		return nil, err
+	}
+	return u.claims, nil
 }
 
 // userinfo returns claims for a bearer access token (OIDC Core §5.3).
@@ -564,6 +586,22 @@ func (p *Provider) userinfo(w http.ResponseWriter, r *http.Request) {
 	if client == nil {
 		invalid("unknown client")
 		return
+	}
+	if did, ok := tok.Get("did"); ok {
+		active := false
+		var err error
+		if p.devices != nil {
+			active, err = p.devices.DeviceActive(r.Context(), stringOf(did))
+		}
+		if err != nil {
+			log.Printf("oidc: device check failed: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "server_error"})
+			return
+		}
+		if !active {
+			invalid("the device was signed out")
+			return
+		}
 	}
 	if sid, ok := tok.Get("sid"); ok {
 		us, err := p.hanko.UserSession(r.Context(), tok.Subject(), stringOf(sid))

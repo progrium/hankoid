@@ -3,6 +3,7 @@ module github.com/progrium/hankoid
 go 1.26.1
 
 require (
+	github.com/coder/websocket v1.8.14
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/labstack/echo-contrib v0.17.4

@@ -44,6 +44,7 @@ Run "hankoid license" for the full license text.`,
 	cmd.AddCommand(newVersionCommand())
 	cmd.AddCommand(newLicenseCommand())
 	cmd.AddCommand(newOIDCCommand())
+	registerCredCommands(cmd)
 	user.RegisterCommands(cmd)
 	siwa.RegisterCommands(cmd)
 	schema.RegisterCommands(cmd)
