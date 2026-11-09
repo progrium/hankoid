@@ -1,6 +1,6 @@
 # hankoid
 
-[Hanko](https://github.com/teamhanko/hanko) with a frontend: a sign-in page, an admin web UI generated from Hanko's admin OpenAPI spec, and an OpenID Connect provider so other apps can sign users in with Hanko. See [NOTES.md](./NOTES.md) for how the spec becomes UI, [oidc/README.md](./oidc/README.md) for running the OIDC provider and [oidc/PLAN.md](./oidc/PLAN.md) for its design.
+[Hanko](https://github.com/teamhanko/hanko) with a frontend: a sign-in page, an admin web UI generated from Hanko's admin OpenAPI spec, and an OpenID Connect provider so other apps can sign users in with Hanko. See [NOTES.md](./NOTES.md) for how the spec becomes UI, [oidc/README.md](./oidc/README.md) for running the OIDC provider, [oidc/PLAN.md](./oidc/PLAN.md) for its design, and [gateway/README.md](./gateway/README.md) for the built-in 9P gateway.
 
 ## Layout
 
@@ -13,19 +13,25 @@
   - `/admin/api/*`: proxied to the Hanko admin API with the same protection. Mutations also need the `X-Admin-UI: 1` header.
   - `/admin/session`: the signed-in admin as JSON.
   - `/oidc/*`: the OIDC provider, when `oidc.clients` is configured (see [OIDC provider](#oidc-provider)).
+  - `/device`, `/account/devices` and `/admin/hankoid/devices`: device sign-in and its devices pages, with `oidc.store: postgres` (see [Device sign-in](#device-sign-in)).
+  - `/.well-known/oauth-protected-resource/*`: metadata for resources on the frontend's own host.
+  - The 9P gateway's routes, when `gateway.routes` is configured.
   - Everything else goes to the Hanko public API, so hanko-elements can call it same-origin (login flow, `/logout`, `/sessions/validate`, …).
-- `oidc/`: the OIDC provider (authorization code flow with PKCE, ID tokens, userinfo, end session).
+- `oidc/`: the OIDC provider (authorization code flow with PKCE, ID tokens, userinfo, end session), device sign-in (RFC 8628) with rotating refresh tokens, and the contract for protected resources (introspection, a revocations feed, RFC 9728 metadata).
+- `credhelper/`: the client side of device sign-in, behind `hankoid login`, `hankoid cred get` and `hankoid logout`.
+- `gateway/`: the built-in 9P-over-WebSocket gateway.
 - `cmd/hankoid`: the Hanko CLI (v3.1.0) rebuilt around Hanko's own command packages, with additions:
   - `serve frontend`: serves the frontend against a running admin/public server. It reads only the `server`, `session.cookie`, `secrets.keys` and `oidc` sections of the config, so no database connection is needed, unless `oidc.store` is `postgres` (then it also reads `database`).
   - `serve all`: starts public, admin, management and frontend. `--no-frontend` skips the UI.
   - `license`: prints the full AGPLv3 license text. The top-level help and `version` also mention the license and source URL.
   - `version`: prints the hankoid and Hanko versions. It replaces upstream's, which depends on a file missing from the published module.
   - `oidc genkey [-o file]`: generates an RSA signing key for the OIDC provider.
+  - `login URL`, `cred get URL`, `logout URL`: sign a machine in to a resource with device sign-in, and print its `Authorization` header as a credential helper (see [Device sign-in](#device-sign-in)).
   - `dev`: only in `-tags dev` builds.
 
 ## Configuration
 
-Everything is read from the Hanko config file (`--config`, default `./config/config.yaml`). Hanko ignores keys it doesn't know, so hankoid adds two of its own: `server.frontend` and the top-level `oidc`. Everything else is plain Hanko config.
+Everything is read from the Hanko config file (`--config`, default `./config/config.yaml`). Hanko ignores keys it doesn't know, so hankoid adds its own: `server.frontend` and the top-level `oidc` and `gateway`. Everything else is plain Hanko config.
 
 ```yaml
 server:
@@ -153,7 +159,8 @@ See [oidc/README.md](./oidc/README.md) for protocol details, the roles claim, ke
 - discovery at `/oidc/.well-known/openid-configuration`
 - `/oidc/jwks.json`
 - `/oidc/authorize`
-- `/oidc/token` (authorization code + PKCE S256; `client_secret_basic` or `client_secret_post`)
+- `/oidc/token` (authorization code + PKCE S256, device code, refresh token; `client_secret_basic`, `client_secret_post`, or `none` for public device clients)
+- `/oidc/device_authorization` (RFC 8628), `/oidc/introspect` (RFC 7662, for resources), `/oidc/revoke` (RFC 7009), `/oidc/revocations` (for resources)
 - `/oidc/userinfo`
 - `/oidc/logout` (RP-initiated logout). With a valid `id_token_hint` it signs out and redirects to an allowed `post_logout_redirect_uri`. Without one it shows a confirmation page, and only a same-origin POST from that page (with its CSRF token) signs out, so a link elsewhere can't log users out.
 
@@ -163,7 +170,7 @@ See [oidc/README.md](./oidc/README.md) for protocol details, the roles claim, ke
   - `prompt=login`, `prompt=none` and `max_age` are supported. `prompt=login` and an exceeded `max_age` don't sign out on the GET; they send the user to `/signin?fresh=1`, and the returned request only succeeds with a session created after that point.
   - A user the client's `access` rule doesn't allow gets `error=access_denied`.
 - **ID tokens** are RS256 with `sub` (the Hanko user ID), `email`, `email_verified`, `nonce`, `sid` and `auth_time`. The `profile` scope adds `name`, `preferred_username` and similar claims; with `roles_claim`, the `roles` (or `profile`) scope adds `roles`.
-- **Access tokens** are JWTs with header `typ: at+jwt`. Userinfo accepts only those, and logout's `id_token_hint` accepts only ID tokens (single configured audience, issued within 30 days). There are no refresh tokens.
+- **Access tokens** are JWTs with header `typ: at+jwt`. Userinfo accepts only those, and logout's `id_token_hint` accepts only ID tokens (single configured audience, issued within 30 days). Only device clients get refresh tokens.
 - **Codes** work once, for 60 seconds. Where they live depends on `oidc.store`:
   - `memory` (default): codes are encrypted with a key derived (HKDF) from `secrets.keys`, so no storage is needed, and used codes are remembered in memory. Run a single instance.
   - `postgres`: codes are random handles for rows in `hankoid.oidc_auth_codes` in Hanko's database (only their SHA-256 is stored), redeemed with one atomic update. Safe across restarts and replicas. The frontend creates the `hankoid` schema at startup (or run `hankoid oidc migrate`); Hanko's migrations never touch it.
@@ -192,6 +199,46 @@ It also warns when:
 - `public_url` is https but `session.cookie.secure` is false;
 - `public_url` isn't in `webauthn.relying_party.origins` or `cors.allow_origins`.
 
+### Device sign-in
+
+Machines without a browser (a CLI, a 9P client) sign in with the OAuth device flow (RFC 8628): the machine shows a code, and the user approves it at `{public_url}/device` with their passkey. It needs `oidc.store: postgres`.
+
+```yaml
+oidc:
+  store: postgres
+  clients:
+    - id: hankfs
+      name: Hank filesystem
+      token_endpoint_auth_method: none   # a public client: no secret
+      grant_types: [device_code]
+      resources: [files]                  # what its tokens may be for
+      access: {organization: staff}
+      # refresh_token_idle_ttl: 720h, refresh_token_max_ttl: 0 (no limit)
+  resources:
+    - id: files
+      audience: wss://files.example.com/9p/files
+      secret: ""                          # ≥16 chars, or secret_hash, or OIDC_RESOURCES_FILES_SECRET
+  # device: {code_ttl: 10m, interval: 5s, max_auth_age: 5m, geo_header: X-Client-Geo}
+```
+
+- **Approving** takes a sign-in from the last `max_auth_age`, so a stolen session cookie can't approve a device. The confirm page names the client and the device, shows the requesting machine's IP (and location, from `geo_header`) next to the approver's, warns when they differ, and defaults to Deny.
+- **Codes** are 8 consonants (`BCDF-GHJK`), single use, valid for `code_ttl`. Wrong guesses are rate limited per session and per IP, and polling faster than `interval` gets `slow_down`.
+- **Tokens:** an approved device gets an access token for the resource's audience (with a `did` claim naming the device) and a refresh token. Refresh tokens rotate on every use and are stored only as hashes. Replaying an old one more than 30 seconds after it was rotated signs the device out.
+- **Devices:** users see and remove their devices at `/account/devices` (or `/account/api/devices`). Admins can list and remove anyone's at `/admin/hankoid/devices?user_id=…`. Removing a device stops its refresh token at once, makes introspection and the gateway refuse its access tokens, and closes its open gateway connections.
+- **Resources** (such as 9P servers) check tokens locally against the JWKS, or with introspection, and poll `/oidc/revocations` to close connections of revoked devices. See [oidc/README.md](./oidc/README.md#protected-resources).
+
+On the machine:
+
+```sh
+hankoid login wss://files.example.com/9p/files      # prints a link and a code, waits for approval
+hankoid cred get wss://files.example.com/9p/files   # prints "Authorization: Bearer …"
+hankoid logout wss://files.example.com/9p/files
+```
+
+`hankoid login` finds the issuer and client through the resource's metadata (pass `--issuer` and `--client` for a resource that doesn't publish it). Credentials are kept in `~/.config/hankoid/credentials.json` (mode 0600; `--credentials` or `HANKOID_CREDENTIALS` to change). `hankoid cred get` follows hyper9's credential helper contract, so h9 can use it directly: `h9 --cred 'files.example.com=hankoid cred' --root wss://files.example.com/9p/files`.
+
+To put an existing 9P server behind device sign-in, use the built-in gateway: see [gateway/README.md](./gateway/README.md).
+
 ## Security
 
 **Production checklist:**
@@ -201,6 +248,7 @@ It also warns when:
 - [ ] `secrets.keys` is a strong random value (≥32 characters), kept out of the config file (`SECRETS_KEYS`).
 - [ ] `admin_access` lists the intended admins, with at least one `users` entry as a break-glass path.
 - [ ] For OIDC: a persistent signing key, `same_site: lax`, client secrets from the environment, and an `access` rule per client. With more than one instance, `oidc.store: postgres` and the same signing key on every instance.
+- [ ] For device sign-in: resource secrets from the environment, `trusted_proxies` set (the confirm page shows the requester's IP), and gateway backends reachable only by the gateway.
 - [ ] `trusted_proxies` matches your actual proxy chain (check the IP on `/signin`).
 - [ ] Only the frontend's port is reachable from outside. Hanko's public port only needs to be reachable by the frontend, which already forwards the public API.
 - [ ] Hanko's own settings reviewed: registration (`account.allow_signup`), email delivery, session lifetime.
@@ -217,7 +265,7 @@ It also warns when:
 
 - The session cookie is shared between the frontend and the Hanko public API it forwards. They're the same origin here, but a cookie `domain` covering other hosts would expose the session to them.
 - OIDC rate limits are in memory, per instance, so N replicas allow N times the burst. Replay protection is too, unless `oidc.store` is `postgres`.
-- Access tokens can't be revoked before they expire (5 minutes by default); userinfo does check the session is still alive.
+- Access tokens can't be revoked before they expire (5 minutes by default); userinfo does check the session is still alive, and a device's tokens stop working everywhere that checks `did` (introspection, userinfo, the gateway) as soon as the device is removed. A resource that only verifies signatures still accepts them until they expire.
 - Hanko's own security (passcodes, passkeys, sessions) is upstream's; hankoid uses it unmodified.
 
 ## Usage
