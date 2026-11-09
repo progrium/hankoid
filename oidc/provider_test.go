@@ -167,9 +167,12 @@ type env struct {
 func newEnv(t *testing.T) *env { return newEnvStore(t, nil) }
 
 // newEnvStore builds a test environment around store; nil means the in-memory store.
-func newEnvStore(t *testing.T, store CodeStore) *env {
+func newEnvStore(t *testing.T, store CodeStore) *env { return newEnvConfig(t, testConfig, store, nil) }
+
+// newEnvConfig builds a test environment from a config; devices, if set, enables the device grant.
+func newEnvConfig(t *testing.T, config string, store CodeStore, devices *DeviceStore) *env {
 	t.Helper()
-	cfg, err := LoadConfig([]byte(testConfig), "http://idp.test", "")
+	cfg, err := LoadConfig([]byte(config), "http://idp.test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,8 +194,12 @@ func newEnvStore(t *testing.T, store CodeStore) *env {
 	e := &env{t: t, hanko: fh, prov: p, now: time.Now()}
 	p.now = func() time.Time { return e.now }
 	setStoreClock(p.codes, p.now)
+	if devices != nil {
+		devices.now = p.now
+		p.SetDeviceStore(devices)
+	}
 	front := frontend.Handler(frontend.Options{Admin: adm, Public: pub, Token: "admintok",
-		Extra: map[string]http.Handler{"/oidc/": p.Handler()}, Labelers: []frontend.NextLabeler{p.Label}})
+		Extra: p.Handlers(), Labelers: []frontend.NextLabeler{p.Label}})
 	tr["idp.test"] = front
 	tr["app.test"] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "app") })
 	tr["mail.test"] = tr["app.test"]

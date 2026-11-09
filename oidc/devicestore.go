@@ -366,10 +366,10 @@ const (
 	RefreshReused                       // replayed after the grace window: the device is now revoked
 )
 
-// Refresh exchanges a refresh token for newToken. A token rotated less than grace ago is treated
+// Refresh exchanges clientID's refresh token for newToken. A token rotated less than grace ago is treated
 // as a concurrent refresh: the device's outstanding token is replaced and newToken issued. Older
 // replays revoke the device (RFC 9700 §4.14.2).
-func (s *DeviceStore) Refresh(ctx context.Context, token, newToken string, newExp time.Time, ip string, grace time.Duration) (RefreshResult, *Device, error) {
+func (s *DeviceStore) Refresh(ctx context.Context, clientID, token, newToken string, newExp time.Time, ip string, grace time.Duration) (RefreshResult, *Device, error) {
 	if token == "" || len(token) > maxCodeLen {
 		return RefreshInvalid, nil, nil
 	}
@@ -391,6 +391,9 @@ func (s *DeviceStore) Refresh(ctx context.Context, token, newToken string, newEx
 		d, err := scanDevice(tx.QueryRow(ctx, `SELECT `+deviceColumns+` FROM hankoid.oidc_devices WHERE id = $1 FOR UPDATE`, deviceID))
 		if err != nil {
 			return err
+		}
+		if d.ClientID != clientID {
+			return nil
 		}
 		dev = d
 		if d.RevokedAt != nil || (d.ExpiresAt != nil && !now.Before(*d.ExpiresAt)) {

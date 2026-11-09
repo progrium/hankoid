@@ -174,26 +174,26 @@ func TestRefreshRotation(t *testing.T) {
 	d := approvedDevice(t, s, "alice", "rt0")
 	grace := 30 * time.Second
 
-	res, got, err := s.Refresh(ctx, "rt0", "rt1", now.Add(time.Hour), "198.51.100.9", grace)
+	res, got, err := s.Refresh(ctx, "cli", "rt0", "rt1", now.Add(time.Hour), "198.51.100.9", grace)
 	if res != RefreshRotated || err != nil || got.ID != d.ID || got.LastUsedIP != "198.51.100.9" {
 		t.Fatalf("rotate: %v %+v %v", res, got, err)
 	}
 	// A concurrent refresh with the old token inside the grace window gets a new token, and
 	// the one handed out a moment ago stops working.
 	*now = now.Add(10 * time.Second)
-	if res, _, _ := s.Refresh(ctx, "rt0", "rt2", now.Add(time.Hour), "", grace); res != RefreshRotated {
+	if res, _, _ := s.Refresh(ctx, "cli", "rt0", "rt2", now.Add(time.Hour), "", grace); res != RefreshRotated {
 		t.Fatalf("grace replay: %v", res)
 	}
 	*now = now.Add(time.Second)
-	if res, _, _ := s.Refresh(ctx, "rt2", "rt3", now.Add(time.Hour), "", grace); res != RefreshRotated {
+	if res, _, _ := s.Refresh(ctx, "cli", "rt2", "rt3", now.Add(time.Hour), "", grace); res != RefreshRotated {
 		t.Fatalf("newest token: %v", res)
 	}
 	// rt0 again, well after the grace window: theft. The device is revoked.
 	*now = now.Add(time.Minute)
-	if res, _, _ := s.Refresh(ctx, "rt0", "rt4", now.Add(time.Hour), "", grace); res != RefreshReused {
+	if res, _, _ := s.Refresh(ctx, "cli", "rt0", "rt4", now.Add(time.Hour), "", grace); res != RefreshReused {
 		t.Fatalf("late replay: %v", res)
 	}
-	if res, _, _ := s.Refresh(ctx, "rt3", "rt5", now.Add(time.Hour), "", grace); res != RefreshInvalid {
+	if res, _, _ := s.Refresh(ctx, "cli", "rt3", "rt5", now.Add(time.Hour), "", grace); res != RefreshInvalid {
 		t.Errorf("token of a revoked device: %v", res)
 	}
 	if dev, _ := s.Device(ctx, d.ID); dev.RevokedAt == nil || dev.RevokedBy != "reuse" {
@@ -206,13 +206,20 @@ func TestRefreshRotation(t *testing.T) {
 	// Idle expiry.
 	d2 := approvedDevice(t, s, "alice", "idle0")
 	*now = now.Add(2 * time.Hour)
-	if res, _, _ := s.Refresh(ctx, "idle0", "idle1", now.Add(time.Hour), "", grace); res != RefreshInvalid {
+	if res, _, _ := s.Refresh(ctx, "cli", "idle0", "idle1", now.Add(time.Hour), "", grace); res != RefreshInvalid {
 		t.Errorf("idle-expired token: %v", res)
 	}
 	if ok, _ := s.DeviceActive(ctx, d2.ID); !ok {
 		t.Error("an idle-expired token shouldn't revoke the device")
 	}
-	if res, _, _ := s.Refresh(ctx, "nope", "x", now.Add(time.Hour), "", grace); res != RefreshInvalid {
+	approvedDevice(t, s, "alice", "oc0")
+	if res, _, _ := s.Refresh(ctx, "other", "oc0", "x", now.Add(time.Hour), "", grace); res != RefreshInvalid {
+		t.Errorf("another client's token: %v", res)
+	}
+	if res, _, _ := s.Refresh(ctx, "cli", "oc0", "oc1", now.Add(time.Hour), "", grace); res != RefreshRotated {
+		t.Errorf("token after another client tried it: %v", res)
+	}
+	if res, _, _ := s.Refresh(ctx, "cli", "nope", "x", now.Add(time.Hour), "", grace); res != RefreshInvalid {
 		t.Errorf("unknown token: %v", res)
 	}
 }
@@ -227,7 +234,7 @@ func TestRefreshParallel(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, _, err := s.Refresh(ctx, "p0", "p1-"+string(rune('a'+i)), now.Add(time.Hour), "", 30*time.Second)
+			res, _, err := s.Refresh(ctx, "cli", "p0", "p1-"+string(rune('a'+i)), now.Add(time.Hour), "", 30*time.Second)
 			if err != nil {
 				t.Error(err)
 			}
@@ -273,7 +280,7 @@ func TestRevocationsAndTickets(t *testing.T) {
 	if err != nil || len(ids) != 1 || ids[0] != b.ID {
 		t.Errorf("revoke all: %v %v", ids, err)
 	}
-	if res, _, _ := s.Refresh(ctx, "b0", "b1", now.Add(time.Hour), "", time.Second); res != RefreshInvalid {
+	if res, _, _ := s.Refresh(ctx, "cli", "b0", "b1", now.Add(time.Hour), "", time.Second); res != RefreshInvalid {
 		t.Errorf("refresh after revoke: %v", res)
 	}
 	if list, _ := s.UserDevices(ctx, "alice"); len(list) != 0 {
