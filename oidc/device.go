@@ -374,6 +374,10 @@ func (p *Provider) Handlers() map[string]http.Handler {
 	h := map[string]http.Handler{"/oidc/": p.Handler()}
 	if p.devices != nil {
 		h["/device"] = p.DeviceHandler()
+		h["/account/"] = p.AccountHandler()
+	}
+	if len(p.cfg.Resources) > 0 {
+		h["GET /.well-known/oauth-protected-resource/"] = http.HandlerFunc(p.resourceMetadata)
 	}
 	return h
 }

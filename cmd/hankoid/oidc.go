@@ -54,7 +54,11 @@ func oidcHandlers(cfg frontend.Config, up frontend.Upstreams) (map[string]http.H
 	}
 	warnOIDCSetup(cfg, oc)
 	log.Printf("oidc: issuer %s with %d client(s)", oc.Issuer, len(oc.Clients))
-	return p.Handlers(), p.Label, nil
+	h := p.Handlers()
+	if pool != nil {
+		h["/admin/hankoid/"] = frontend.NewAuth(up.Public, cfg.AdminAccess).RequireAdmin(p.AdminDevicesHandler(), true)
+	}
+	return h, p.Label, nil
 }
 
 func runDeviceCleanup(ctx context.Context, ds *oidc.DeviceStore) {
