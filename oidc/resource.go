@@ -31,35 +31,36 @@ type Principal struct {
 	Expiry   time.Time
 }
 
-var errInvalidToken = errors.New("invalid token")
+// ErrInvalidToken is returned when a credential is refused (see IsInvalidToken).
+var ErrInvalidToken = errors.New("invalid token")
 
 // Authenticate verifies an access token for audience: our signature and issuer, typ at+jwt, not
 // expired, and audience among its aud. A token naming a device is only valid while the device is.
 func (p *Provider) Authenticate(ctx context.Context, raw, audience string) (*Principal, error) {
 	if raw == "" || !strings.EqualFold(tokenTyp(raw), "at+jwt") {
-		return nil, errInvalidToken
+		return nil, ErrInvalidToken
 	}
 	tok, err := jwt.Parse([]byte(raw), jwt.WithKeySet(p.keys.public), jwt.WithValidate(true),
 		jwt.WithIssuer(p.cfg.Issuer), jwt.WithAudience(audience), jwt.WithClock(jwt.ClockFunc(p.now)))
 	if err != nil {
-		return nil, errInvalidToken
+		return nil, ErrInvalidToken
 	}
 	get := func(k string) string { v, _ := tok.Get(k); return stringOf(v) }
 	pr := &Principal{UserID: tok.Subject(), Username: get("preferred_username"), DeviceID: get("did"),
 		ClientID: get("client_id"), Audience: audience, Scope: get("scope"), Expiry: tok.Expiration()}
 	if p.cfg.Client(pr.ClientID) == nil {
-		return nil, errInvalidToken
+		return nil, ErrInvalidToken
 	}
 	if pr.DeviceID != "" {
 		if p.devices == nil {
-			return nil, errInvalidToken
+			return nil, ErrInvalidToken
 		}
 		ok, err := p.devices.DeviceActive(ctx, pr.DeviceID)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
-			return nil, errInvalidToken
+			return nil, ErrInvalidToken
 		}
 	}
 	return pr, nil
@@ -78,11 +79,11 @@ func (p *Provider) IssueTicket(ctx context.Context, pr *Principal, ttl time.Dura
 // RedeemTicket returns the principal a ticket for audience stands for, once.
 func (p *Provider) RedeemTicket(ctx context.Context, ticket, audience string) (*Principal, error) {
 	if p.devices == nil {
-		return nil, errInvalidToken
+		return nil, ErrInvalidToken
 	}
 	t, err := p.devices.RedeemTicket(ctx, ticket, audience)
 	if errors.Is(err, errNotFound) {
-		return nil, errInvalidToken
+		return nil, ErrInvalidToken
 	}
 	if err != nil {
 		return nil, err
@@ -93,7 +94,7 @@ func (p *Provider) RedeemTicket(ctx context.Context, ticket, audience string) (*
 			return nil, err
 		}
 		if !ok {
-			return nil, errInvalidToken
+			return nil, ErrInvalidToken
 		}
 	}
 	return &Principal{UserID: t.UserID, Username: t.Username, DeviceID: t.DeviceID, ClientID: t.ClientID, Audience: audience}, nil
@@ -101,7 +102,7 @@ func (p *Provider) RedeemTicket(ctx context.Context, ticket, audience string) (*
 
 // IsInvalidToken reports whether err means the credential was refused (as opposed to a failure
 // to check it).
-func IsInvalidToken(err error) bool { return errors.Is(err, errInvalidToken) }
+func IsInvalidToken(err error) bool { return errors.Is(err, ErrInvalidToken) }
 
 // UserSession loads a user's identity and organizations through the admin API, for access rules.
 func (p *Provider) UserSession(ctx context.Context, userID string) (*frontend.Session, error) {

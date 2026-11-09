@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/progrium/hankoid/frontend"
+	"github.com/progrium/hankoid/gateway"
 	"github.com/progrium/hankoid/oidc"
 	"gopkg.in/yaml.v3"
 )
@@ -24,6 +26,9 @@ func oidcHandlers(cfg frontend.Config, up frontend.Upstreams) (map[string]http.H
 		return nil, nil, err
 	}
 	if !oc.Enabled() {
+		if gc, err := gateway.LoadConfig(cfg.Raw, func(string) string { return "" }); err != nil || len(gc.Routes) > 0 {
+			return nil, nil, fmt.Errorf("gateway.routes needs the OIDC provider (oidc.clients and oidc.resources)")
+		}
 		return nil, nil, nil
 	}
 	oc.TrustedProxies = cfg.TrustedProxies
@@ -57,6 +62,9 @@ func oidcHandlers(cfg frontend.Config, up frontend.Upstreams) (map[string]http.H
 	h := p.Handlers()
 	if pool != nil {
 		h["/admin/hankoid/"] = frontend.NewAuth(up.Public, cfg.AdminAccess).RequireAdmin(p.AdminDevicesHandler(), true)
+	}
+	if err := addGateway(ctx, h, cfg, up, oc, p); err != nil {
+		return nil, nil, err
 	}
 	return h, p.Label, nil
 }
@@ -139,4 +147,34 @@ func warnOIDCSetup(cfg frontend.Config, oc *oidc.Config) {
 	if len(tenant.Cors.AllowOrigins) > 0 && !slices.Contains(tenant.Cors.AllowOrigins, origin) {
 		log.Printf("oidc: %s is not in cors.allow_origins; hanko-elements on /signin may fail", origin)
 	}
+}
+
+// addGateway mounts the built-in 9P gateway's routes, if gateway.routes is configured.
+func addGateway(ctx context.Context, h map[string]http.Handler, cfg frontend.Config, up frontend.Upstreams, oc *oidc.Config, p *oidc.Provider) error {
+	audience := func(id string) string {
+		if r := oc.Resource(id); r != nil {
+			return r.Audience
+		}
+		return ""
+	}
+	gc, err := gateway.LoadConfig(cfg.Raw, audience)
+	if err != nil {
+		return err
+	}
+	if len(gc.Routes) == 0 {
+		return nil
+	}
+	if p.DeviceStore() == nil {
+		return fmt.Errorf("gateway.routes needs oidc.store: postgres")
+	}
+	gw := gateway.New(gc, p, audience)
+	gw.Session = frontend.NewAuth(up.Public, cfg.AdminAccess).Session
+	go gw.Run(ctx)
+	for pattern, handler := range gw.Handlers() {
+		h[pattern] = handler
+	}
+	for _, r := range gc.Routes {
+		log.Printf("gateway: %s -> %s (%s)", r.Path, r.Backend, strings.Join(r.Versions, ", "))
+	}
+	return nil
 }
