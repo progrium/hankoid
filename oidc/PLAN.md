@@ -259,6 +259,8 @@ The operator must set these Hanko session settings. They are checked at startup 
 
 **Optional: Postgres as the provider's store.** Not needed for a single instance. These are the tables to add if we later want restart-safe codes, replicas, revocation, or managing clients from the admin UI instead of config.
 
+> **Status:** the authorization-code part is built, as `oidc.store: postgres` (`oidc/pgstore.go`, migrations in `oidc/migrations/`). Differences from the sketch below: `user_id`/`session_id` are `text` (no type coupling to Hanko's IDs), `session_id` is nullable, expiry is checked against the provider's clock like the memory store, and migrations run at startup under an advisory lock as well as through `hankoid oidc migrate`. `oidc_clients`, `oidc_keys` and `oidc_access_tokens` are not built.
+
 - Use the same database as Hanko, but our own schema (`hankoid`) so Hanko's migrations never see or touch them.
 - Migrate with an embedded SQL file run by a new `hankoid migrate oidc` (or as part of `serve`).
 
@@ -453,7 +455,7 @@ oidc/
 
 ## Decisions
 
-- **Deployment:** single instance, no replicas. Codes use sealed blobs plus an in-memory replay set. The Postgres store above is documented for later and not built now.
+- **Deployment:** single instance by default: codes use sealed blobs plus an in-memory replay set. `oidc.store: postgres` keeps codes in the `hankoid` schema for restarts and replicas (added later; see §3).
 - **Signing key:** provider-owned (rationale in §3). Configure it with `oidc.signing_key_file` or `OIDC_SIGNING_KEY`; it's generated on startup only for dev.
 - **Config location:** a top-level `oidc` key in the Hanko config file. `server.frontend` keeps `address` and `public_url`.
 - **Access:** per-client `access` with a static `users` list and/or an organization rule (`organization` + `roles`). Either rule admits the user. `access` is required; `any_user: true` opens a client to every Hanko user (changed in the security review).

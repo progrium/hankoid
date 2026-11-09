@@ -32,6 +32,11 @@ type Config struct {
 	CodeTTL                time.Duration `yaml:"code_ttl"`
 	IDTokenTTL             time.Duration `yaml:"id_token_ttl"`
 	AccessTokenTTL         time.Duration `yaml:"access_token_ttl"`
+	// Store is where authorization codes live: "memory" (the default; one instance only) or
+	// "postgres" (Hanko's database, in a separate hankoid schema; restart- and replica-safe).
+	Store string `yaml:"store"`
+	// Database is Hanko's top-level database section, read only when Store is "postgres".
+	Database Database `yaml:"-"`
 	// TrustedProxies is server.frontend.trusted_proxies, set by the caller; it's used to find the
 	// client IP for rate limiting. Empty means the TCP peer address is used.
 	TrustedProxies []string `yaml:"-"`
@@ -84,9 +89,16 @@ func (c *Config) Client(id string) *Client {
 	return nil
 }
 
+// Store values for Config.Store.
+const (
+	StoreMemory   = "memory"
+	StorePostgres = "postgres"
+)
+
 type file struct {
-	OIDC    Config `yaml:"oidc"`
-	Secrets struct {
+	OIDC     Config   `yaml:"oidc"`
+	Database Database `yaml:"database"`
+	Secrets  struct {
 		Keys []string `yaml:"keys"`
 	} `yaml:"secrets"`
 }
@@ -102,8 +114,9 @@ func ClientEnvPrefix(id string) string {
 // applies environment overrides, and validates. publicURL is server.frontend.public_url.
 // Relative key file paths are resolved against baseDir (the config file's directory).
 //
-// Environment: OIDC_SIGNING_KEY (PEM), SECRETS_KEYS (comma-separated, like Hanko), and per
-// client OIDC_CLIENTS_<ID>_SECRET and OIDC_CLIENTS_<ID>_ACCESS_USERS (comma-separated).
+// Environment: OIDC_SIGNING_KEY (PEM), OIDC_STORE, SECRETS_KEYS (comma-separated, like Hanko),
+// Hanko's DATABASE_* variables, and per client OIDC_CLIENTS_<ID>_SECRET and
+// OIDC_CLIENTS_<ID>_ACCESS_USERS (comma-separated).
 func LoadConfig(raw []byte, publicURL, baseDir string) (*Config, error) {
 	var f file
 	if err := yaml.Unmarshal(raw, &f); err != nil {
@@ -118,6 +131,14 @@ func LoadConfig(raw []byte, publicURL, baseDir string) (*Config, error) {
 	if v := os.Getenv("OIDC_SIGNING_KEY"); v != "" {
 		c.SigningKey = v
 	}
+	if v := os.Getenv("OIDC_STORE"); v != "" {
+		c.Store = v
+	}
+	if c.Store == "" {
+		c.Store = StoreMemory
+	}
+	c.Database = f.Database
+	c.Database.applyEnv()
 	for _, f := range []*string{&c.SigningKeyFile, &c.PreviousSigningKeyFile} {
 		if *f != "" && !filepath.IsAbs(*f) {
 			*f = filepath.Join(baseDir, *f)
@@ -165,6 +186,15 @@ func (c *Config) Validate() error {
 	}
 	if len(c.SecretKeys) == 0 {
 		errs = append(errs, errors.New("oidc: secrets.keys must be set (used to seal authorization codes)"))
+	}
+	switch c.Store {
+	case "", StoreMemory:
+	case StorePostgres:
+		if _, err := c.Database.URL(); err != nil {
+			errs = append(errs, fmt.Errorf("oidc: store postgres: %w", err))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("oidc: store must be %q or %q, not %q", StoreMemory, StorePostgres, c.Store))
 	}
 	if !isLoopbackURL(c.Issuer) {
 		for _, k := range c.SecretKeys {

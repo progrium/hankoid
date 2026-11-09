@@ -28,7 +28,7 @@ import (
 type Provider struct {
 	cfg   *Config
 	keys  *Keys
-	codes *codes
+	codes CodeStore
 	hanko Hanko
 	now   func() time.Time
 
@@ -37,17 +37,21 @@ type Provider struct {
 	proxies  frontend.Proxies
 }
 
-// New builds a provider. cfg must already be validated.
-func New(cfg *Config, keys *Keys, h Hanko) (*Provider, error) {
-	c, err := newCodes(cfg.SecretKeys)
-	if err != nil {
-		return nil, err
+// New builds a provider. cfg must already be validated. A nil store keeps codes in memory
+// (sealed blobs plus an in-memory replay set); see NewPostgresCodes for the shared store.
+func New(cfg *Config, keys *Keys, h Hanko, store CodeStore) (*Provider, error) {
+	if store == nil {
+		m, err := newMemoryCodes(cfg.SecretKeys)
+		if err != nil {
+			return nil, err
+		}
+		store = m
 	}
 	proxies, err := frontend.ParseProxies(cfg.TrustedProxies)
 	if err != nil {
 		return nil, err
 	}
-	return &Provider{cfg: cfg, keys: keys, codes: c, hanko: h, now: time.Now, limiters: map[string]*limiterEntry{}, proxies: proxies}, nil
+	return &Provider{cfg: cfg, keys: keys, codes: store, hanko: h, now: time.Now, limiters: map[string]*limiterEntry{}, proxies: proxies}, nil
 }
 
 func (p *Provider) endpoint(name string) string { return p.cfg.Issuer + "/" + name }
@@ -223,14 +227,14 @@ func (p *Provider) authorize(w http.ResponseWriter, r *http.Request) {
 		fail("access_denied", "this account may not sign in to "+client.DisplayName())
 		return
 	}
-	code, err := p.codes.seal(codeData{
+	code, err := p.codes.Issue(r.Context(), codeData{
 		ClientID: client.ID, RedirectURI: redirectURI, UserID: s.UserID, SessionID: s.SessionID,
 		Nonce: q.Get("nonce"), CodeChallenge: challenge, Scope: strings.Join(granted, " "),
 		AuthTime: authTime, Exp: p.now().Add(p.cfg.CodeTTL),
 	})
 	if err != nil {
-		log.Printf("oidc: seal code: %v", err)
-		fail("server_error", "")
+		log.Printf("oidc: issue code: %v", err)
+		fail("temporarily_unavailable", "")
 		return
 	}
 	u, _ := url.Parse(redirectURI)
@@ -345,7 +349,12 @@ func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 		tokenError(w, http.StatusBadRequest, "unsupported_grant_type", "only authorization_code is supported")
 		return
 	}
-	d, err := p.codes.open(r.PostForm.Get("code"))
+	d, err := p.codes.Redeem(r.Context(), r.PostForm.Get("code"))
+	if err != nil && !errors.Is(err, errBadCode) {
+		log.Printf("oidc: redeem code: %v", err)
+		tokenError(w, http.StatusInternalServerError, "server_error", "code store unavailable")
+		return
+	}
 	if err != nil || d.ClientID != client.ID || d.RedirectURI != r.PostForm.Get("redirect_uri") {
 		tokenError(w, http.StatusBadRequest, "invalid_grant", "invalid, expired, or already used code")
 		return

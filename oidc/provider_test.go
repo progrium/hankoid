@@ -164,7 +164,10 @@ type env struct {
 	now    time.Time
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvStore(t, nil) }
+
+// newEnvStore builds a test environment around store; nil means the in-memory store.
+func newEnvStore(t *testing.T, store CodeStore) *env {
 	t.Helper()
 	cfg, err := LoadConfig([]byte(testConfig), "http://idp.test", "")
 	if err != nil {
@@ -181,13 +184,13 @@ func newEnv(t *testing.T) *env {
 	auth := frontend.NewAuth(pub, frontend.AccessRule{})
 	api := frontend.NewAdminAPI(adm, "admintok")
 	setTransport(t, tr)
-	p, err := New(cfg, keys, NewHanko(auth, api))
+	p, err := New(cfg, keys, NewHanko(auth, api), store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := &env{t: t, hanko: fh, prov: p, now: time.Now()}
 	p.now = func() time.Time { return e.now }
-	p.codes.now = p.now
+	setStoreClock(p.codes, p.now)
 	front := frontend.Handler(frontend.Options{Admin: adm, Public: pub, Token: "admintok",
 		Extra: map[string]http.Handler{"/oidc/": p.Handler()}, Labelers: []frontend.NextLabeler{p.Label}})
 	tr["idp.test"] = front
@@ -240,8 +243,10 @@ func (e *env) follow(raw string) (*url.URL, *http.Response) {
 	return nil, nil
 }
 
-func TestEndToEnd(t *testing.T) {
-	e := newEnv(t)
+func TestEndToEnd(t *testing.T) { forEachStore(t, testEndToEnd) }
+
+func testEndToEnd(t *testing.T, store CodeStore) {
+	e := newEnvStore(t, store)
 	provider, err := gooidc.NewProvider(e.ctx, "http://idp.test/oidc")
 	if err != nil {
 		t.Fatal(err)
@@ -458,8 +463,10 @@ func TestAccessAndRoles(t *testing.T) {
 	}
 }
 
-func TestTokenErrors(t *testing.T) {
-	e := newEnv(t)
+func TestTokenErrors(t *testing.T) { forEachStore(t, testTokenErrors) }
+
+func testTokenErrors(t *testing.T, store CodeStore) {
+	e := newEnvStore(t, store)
 	e.signIn("alice")
 	redirect := "https://app.test/callback"
 	form := func(code string) url.Values {
@@ -644,7 +651,7 @@ func TestLogoutHintChecks(t *testing.T) {
 
 func TestRateLimiterAndProxies(t *testing.T) {
 	cfg := &Config{SecretKeys: []string{"0123456789abcdef0123456789abcdef"}, TrustedProxies: []string{"10.0.0.0/8"}}
-	p, err := New(cfg, nil, nil)
+	p, err := New(cfg, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

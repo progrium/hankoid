@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/progrium/hankoid/frontend"
 	"github.com/progrium/hankoid/oidc"
@@ -28,13 +32,46 @@ func oidcHandlers(cfg frontend.Config, up frontend.Upstreams) (map[string]http.H
 		return nil, nil, err
 	}
 	hanko := oidc.NewHanko(frontend.NewAuth(up.Public, cfg.AdminAccess), frontend.NewAdminAPI(up.Admin, frontend.AdminToken()))
-	p, err := oidc.New(oc, keys, hanko)
+	store, err := oidcCodeStore(context.Background(), oc)
+	if err != nil {
+		return nil, nil, err
+	}
+	p, err := oidc.New(oc, keys, hanko, store)
 	if err != nil {
 		return nil, nil, err
 	}
 	warnOIDCSetup(cfg, oc)
 	log.Printf("oidc: issuer %s with %d client(s)", oc.Issuer, len(oc.Clients))
 	return map[string]http.Handler{"/oidc/": p.Handler()}, p.Label, nil
+}
+
+// oidcCodeStore returns nil (the in-memory store) unless oidc.store is postgres. Then it connects
+// to Hanko's database, applies the hankoid schema migrations, and starts expiring old codes.
+func oidcCodeStore(ctx context.Context, oc *oidc.Config) (oidc.CodeStore, error) {
+	if oc.Store != oidc.StorePostgres {
+		log.Printf("oidc: codes are kept in memory; run a single instance (set oidc.store: postgres for restarts and replicas)")
+		return nil, nil
+	}
+	pool, err := openOIDCDatabase(ctx, oc)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := oidc.Migrate(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	store := oidc.NewPostgresCodes(pool)
+	go store.RunCleanup(ctx, 10*time.Minute)
+	log.Printf("oidc: codes are kept in postgres (schema hankoid)")
+	return store, nil
+}
+
+func openOIDCDatabase(ctx context.Context, oc *oidc.Config) (*pgxpool.Pool, error) {
+	dsn, err := oc.Database.URL()
+	if err != nil {
+		return nil, err
+	}
+	return oidc.OpenPostgres(ctx, dsn)
 }
 
 // warnOIDCSetup flags Hanko settings that commonly break the OIDC flow.
