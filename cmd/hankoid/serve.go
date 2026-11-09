@@ -59,7 +59,8 @@ Routes: /signin (Hanko sign-in), /admin/ (admin UI, limited by server.frontend.a
 and everything else to the public API.
 
 Only the server, session.cookie, secrets.keys, and oidc sections of the config are read,
-so the database need not be configured.`,
+so the database need not be configured, unless oidc.store is postgres: then the database
+section is read too, and the hankoid schema is migrated at startup.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			var wg sync.WaitGroup
 			wg.Add(1)

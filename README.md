@@ -16,7 +16,7 @@
   - Everything else goes to the Hanko public API, so hanko-elements can call it same-origin (login flow, `/logout`, `/sessions/validate`, …).
 - `oidc/`: the OIDC provider (authorization code flow with PKCE, ID tokens, userinfo, end session).
 - `cmd/hankoid`: the Hanko CLI (v3.1.0) rebuilt around Hanko's own command packages, with additions:
-  - `serve frontend`: serves the frontend against a running admin/public server. It reads only the `server`, `session.cookie`, `secrets.keys` and `oidc` sections of the config, so no database connection is needed.
+  - `serve frontend`: serves the frontend against a running admin/public server. It reads only the `server`, `session.cookie`, `secrets.keys` and `oidc` sections of the config, so no database connection is needed, unless `oidc.store` is `postgres` (then it also reads `database`).
   - `serve all`: starts public, admin, management and frontend. `--no-frontend` skips the UI.
   - `license`: prints the full AGPLv3 license text. The top-level help and `version` also mention the license and source URL.
   - `version`: prints the hankoid and Hanko versions. It replaces upstream's, which depends on a file missing from the published module.
@@ -79,6 +79,7 @@ Environment variables override the file. Lists are comma-separated.
 | `SESSION_COOKIE_SAME_SITE`, `SESSION_COOKIE_SECURE` | `session.cookie.same_site`, `.secure` |
 | `SECRETS_KEYS` | `secrets.keys` |
 | `OIDC_SIGNING_KEY` | `oidc.signing_key` (PEM) |
+| `OIDC_STORE` | `oidc.store` (`memory` or `postgres`) |
 | `OIDC_CLIENTS_<ID>_SECRET` | a client's `secret` (`<ID>` uppercased, non-alphanumerics as `_`) |
 | `OIDC_CLIENTS_<ID>_ACCESS_USERS` | a client's `access.users` |
 | `HANKO_ADMIN_TOKEN` | bearer token the frontend sends to the admin API (not in the file) |
@@ -120,6 +121,7 @@ oidc:
   signing_key_file: oidc.pem    # RSA key (hankoid oidc genkey -o oidc.pem); relative to the config file
   # previous_signing_key_file: oidc-old.pem   # still published in JWKS during key rotation
   # code_ttl: 60s, id_token_ttl: 5m, access_token_ttl: 5m
+  # store: postgres   # keep codes in Hanko's database (schema hankoid) for restarts and replicas; default memory
   clients:
     - id: myapp
       name: My App              # shown on the sign-in page ("Sign in to continue to My App")
@@ -162,10 +164,11 @@ See [oidc/README.md](./oidc/README.md) for protocol details, the roles claim, ke
   - A user the client's `access` rule doesn't allow gets `error=access_denied`.
 - **ID tokens** are RS256 with `sub` (the Hanko user ID), `email`, `email_verified`, `nonce`, `sid` and `auth_time`. The `profile` scope adds `name`, `preferred_username` and similar claims; with `roles_claim`, the `roles` (or `profile`) scope adds `roles`.
 - **Access tokens** are JWTs with header `typ: at+jwt`. Userinfo accepts only those, and logout's `id_token_hint` accepts only ID tokens (single configured audience, issued within 30 days). There are no refresh tokens.
-- **Codes** are encrypted with a key derived (HKDF) from `secrets.keys`, so no storage is needed. Each one works once, for 60 seconds.
+- **Codes** work once, for 60 seconds. Where they live depends on `oidc.store`:
+  - `memory` (default): codes are encrypted with a key derived (HKDF) from `secrets.keys`, so no storage is needed, and used codes are remembered in memory. Run a single instance.
+  - `postgres`: codes are random handles for rows in `hankoid.oidc_auth_codes` in Hanko's database (only their SHA-256 is stored), redeemed with one atomic update. Safe across restarts and replicas. The frontend creates the `hankoid` schema at startup (or run `hankoid oidc migrate`); Hanko's migrations never touch it.
   - The token endpoint checks the Hanko session still exists and the user is still allowed, so a sign-out or revoked membership in between invalidates the code.
   - Userinfo does the same check.
-  - Replay protection is in memory: run a single instance (see `oidc/PLAN.md` for the tables multiple instances would need).
 - **Rate limiting** on `/oidc/token` is per client and per IP (see [Client IP](#client-ip-and-reverse-proxies)).
 
 **Signing keys:**
@@ -197,7 +200,7 @@ It also warns when:
 - [ ] TLS terminates in front of the frontend; `public_url` is `https`; `session.cookie.secure` is true.
 - [ ] `secrets.keys` is a strong random value (≥32 characters), kept out of the config file (`SECRETS_KEYS`).
 - [ ] `admin_access` lists the intended admins, with at least one `users` entry as a break-glass path.
-- [ ] For OIDC: a persistent signing key, `same_site: lax`, client secrets from the environment, and an `access` rule per client.
+- [ ] For OIDC: a persistent signing key, `same_site: lax`, client secrets from the environment, and an `access` rule per client. With more than one instance, `oidc.store: postgres` and the same signing key on every instance.
 - [ ] `trusted_proxies` matches your actual proxy chain (check the IP on `/signin`).
 - [ ] Only the frontend's port is reachable from outside. Hanko's public port only needs to be reachable by the frontend, which already forwards the public API.
 - [ ] Hanko's own settings reviewed: registration (`account.allow_signup`), email delivery, session lifetime.
@@ -213,7 +216,7 @@ It also warns when:
 **Known limitations:**
 
 - The session cookie is shared between the frontend and the Hanko public API it forwards. They're the same origin here, but a cookie `domain` covering other hosts would expose the session to them.
-- OIDC replay protection and rate limits are in memory, per instance.
+- OIDC rate limits are in memory, per instance, so N replicas allow N times the burst. Replay protection is too, unless `oidc.store` is `postgres`.
 - Access tokens can't be revoked before they expire (5 minutes by default); userinfo does check the session is still alive.
 - Hanko's own security (passcodes, passkeys, sessions) is upstream's; hankoid uses it unmodified.
 

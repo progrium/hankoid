@@ -4,7 +4,7 @@ Reference for running the OIDC provider. Configuration, setup steps and the prod
 
 ## How it uses Hanko
 
-The provider runs inside the frontend and uses Hanko unmodified, with no database access and no tables of its own:
+The provider runs inside the frontend and uses Hanko unmodified. By default it has no database access and no tables of its own; with `oidc.store: postgres` it keeps authorization codes in its own `hankoid` schema (see [State and restarts](#state-and-restarts)). Everything else comes from Hanko's APIs:
 
 | Need | Source |
 |---|---|
@@ -84,12 +84,29 @@ Discovery, JWKS and userinfo allow any origin (CORS, no credentials). Authorize,
 
 ## State and restarts
 
-Nothing is stored. What that means operationally:
+`oidc.store` (or `OIDC_STORE`) decides where authorization codes live.
 
-- **Codes** are sealed with a key derived from `secrets.keys` and live 60 seconds. Changing `secrets.keys` invalidates in-flight codes (and Hanko's own sealed data, so don't).
-- **Replay protection** is an in-memory set of used codes. A restart within a code's lifetime clears it; a replay would still need the client secret, the PKCE verifier and a live session.
-- **Signing key:** without `signing_key_file` / `OIDC_SIGNING_KEY`, a new key is generated at each start and every outstanding token stops verifying.
-- **One instance only.** With several replicas, replay protection and rate limits would be per replica. `PLAN.md` ("Optional: Postgres as the provider's store") lists the tables needed to scale out.
+| | `memory` (default) | `postgres` |
+|---|---|---|
+| Code | sealed blob, encrypted with a key derived from `secrets.keys` | 32 random bytes; the row is keyed by its SHA-256 |
+| Replay protection | in-memory set of used codes | `UPDATE … SET used_at … WHERE used_at IS NULL`, atomic across replicas |
+| Restart within a code's 60s | used codes are forgotten; a replay would still need the client secret, the PKCE verifier and a live session | nothing lost |
+| Replicas | not supported: each replica has its own used set | supported |
+| Needs | nothing | Hanko's `database` section (Postgres only) |
+
+**With `postgres`:**
+
+- The frontend reads Hanko's `database` section (and `DATABASE_*` variables) and connects with a pool of up to 4 connections. A non-Postgres dialect is a startup error.
+- At startup it creates the `hankoid` schema and applies any pending migrations under an advisory lock, so replicas can start together. `hankoid oidc migrate --config …` does the same as a separate step. `hankoid migrate up` only migrates Hanko's own tables and never touches `hankoid`.
+- Rows are deleted an hour after their code expires, by every instance, every 10 minutes.
+- If the database is down, authorize redirects with `error=temporarily_unavailable` and the token endpoint answers 500 `server_error`.
+- Switching stores invalidates only the codes issued in the last 60 seconds. `DROP SCHEMA hankoid CASCADE` removes everything the provider stored without affecting Hanko.
+
+**Either way:**
+
+- **Signing key:** without `signing_key_file` / `OIDC_SIGNING_KEY`, a new key is generated at each start and every outstanding token stops verifying. Replicas must share one key.
+- **Rate limits** are in memory, per instance, so N replicas allow N times the burst.
+- Changing `secrets.keys` invalidates in-flight `memory` codes (and Hanko's own sealed data, so don't).
 
 ## Signing keys
 
@@ -109,7 +126,8 @@ Nothing is stored. What that means operationally:
 | Client says the issuer doesn't match | the client's provider URL isn't exactly `{public_url}/oidc`; check `public_url` against what users see (scheme, host, port) |
 | Error page "Invalid redirect" or "Unknown application" (no redirect) | the client's callback URL isn't listed exactly in `redirect_uris` |
 | `error=access_denied` | the user doesn't match the client's `access`; organization names are case-sensitive, emails must be verified |
-| `invalid_grant` at the token endpoint | code older than `code_ttl`, used twice, the session ended, access revoked in between, or a PKCE mismatch |
+| `invalid_grant` at the token endpoint | code older than `code_ttl`, used twice, the session ended, access revoked in between, a PKCE mismatch, or (with the `memory` store and several replicas) the code was issued by another instance |
+| `server_error` from the token endpoint, `temporarily_unavailable` from authorize | with `oidc.store: postgres`, the database is unreachable |
 | `invalid_client` | wrong secret, or `OIDC_CLIENTS_<ID>_SECRET` not set in the frontend's environment |
 | Tokens stop verifying after a restart | no persistent signing key configured |
 | Passkeys fail on `/signin` | `public_url`'s origin isn't in `webauthn.relying_party.origins` (startup warns) |

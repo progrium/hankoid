@@ -20,4 +20,5 @@ server:
     address: ":8080"
 # OIDC provider: add clients here (secrets via OIDC_CLIENTS_<ID>_SECRET) to enable /oidc/*.
 oidc:
+  # store: postgres   # codes in this database (schema hankoid); needed for more than one instance
   clients: []

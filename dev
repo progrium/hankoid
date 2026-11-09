@@ -93,6 +93,7 @@ EOF
 # OIDC provider (issuer http://localhost:8080/oidc). Add clients to enable it.
 oidc:
   signing_key_file: oidc-signing.pem
+  store: postgres
   clients: []
 EOF
 	} >"$CONFIG"
